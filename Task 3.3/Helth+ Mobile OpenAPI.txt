@@ -1,0 +1,626 @@
+openapi: "3.0.3"
+info:
+  title: "Здоровье+ — API мобильного приложения"
+  description: |
+    API для мобильного приложения пациентов сети клиник «Здоровья+».
+    Предоставляет возможность записи к врачу, получения результатов анализов,
+    оплаты услуг и управления полисами ДМС.
+  version: "1.0.0"
+  contact:
+    name: "IT-департамент Здоровье+"
+    email: "api@zdorovieplus.ru"
+
+servers:
+  - url: "https://api.zdorovieplus.ru/api/v1"
+    description: "Production сервер (API Gateway)"
+  - url: "https://staging-api.zdorovieplus.ru/api/v1"
+    description: "Staging сервер для предпрод тестирования"
+  - url: "https://test-api.zdorovieplus.ru/api/v1"
+    description: "Test сервер для тестирования"
+paths:
+  /appointments:
+    get:
+      summary: "Получение списка предстоящих записей пациента"
+      description: |
+        Возвращает список записей к врачу для авторизованного пациента.
+        Поддерживает фильтрацию по статусу, пагинацию (limit/offset) и
+        сортировку по дате приёма (по умолчанию — от ближайших к дальним).
+        
+        **Требования к производительности:**
+        - SLO: 99% запросов < 1 секунда
+        - Обеспечивается через Redis cache (95% cache hit)
+        - Кэш инвалидируется при изменении статуса записи (событие в Kafka)
+      operationId: "getAppointments"
+      tags:
+        - "Записи к врачу"
+      parameters:
+        - name: "status"
+          in: "query"
+          description: |
+            Фильтр по статусу записи.
+            - `upcoming` — предстоящие записи (по умолчанию)
+            - `past` — прошедшие записи
+            - `cancelled` — отменённые записи
+          required: false
+          schema:
+            type: "string"
+            enum:
+              - "upcoming"
+              - "past"
+              - "cancelled"
+            default: "upcoming"
+          example: "upcoming"
+
+        - name: "limit"
+          in: "query"
+          description: |
+            Максимальное количество записей в ответе.
+            Значение по умолчанию: 10. Максимальное значение: 50.
+            Используется для постраничной навигации (page size).
+          required: false
+          schema:
+            type: "integer"
+            format: "int32"
+            minimum: 1
+            maximum: 50
+            default: 10
+          example: 20
+
+        - name: "offset"
+          in: "query"
+          description: |
+            Смещение от начала списка записей (количество пропущенных записей).
+            Используется для постраничной навигации (page number).
+            
+            **Пример расчёта:**
+            - offset=0, limit=10 → страница 1 (записи 1-10)
+            - offset=10, limit=10 → страница 2 (записи 11-20)
+            - offset=20, limit=10 → страница 3 (записи 21-30)
+          required: false
+          schema:
+            type: "integer"
+            format: "int32"
+            minimum: 0
+            default: 0
+          example: 20
+
+        - name: "date_from"
+          in: "query"
+          description: |
+            Фильтр по дате приёма (начало диапазона).
+            Формат: YYYY-MM-DD. Если не указан, используется текущая дата
+            для фильтра `upcoming`.
+          required: false
+          schema:
+            type: "string"
+            format: "date"
+          example: "2025-05-01"
+
+        - name: "date_to"
+          in: "query"
+          description: |
+            Фильтр по дате приёма (конец диапазона).
+            Формат: YYYY-MM-DD.
+          required: false
+          schema:
+            type: "string"
+            format: "date"
+          example: "2025-06-01"
+
+      security:
+        - BearerAuth: []
+
+      responses:
+        '200':
+          description: |
+            Успешный ответ. Возвращает список записей и метаданные пагинации.
+            
+            **Гарантии:**
+            - Время отклика: < 1 секунда для 99% запросов (SLO)
+            - Данные актуальны на момент запроса (кэш инвалидируется через Kafka)
+            - Пагинация основана на offset (не cursor), так как записи
+              редко меняют порядок и не требуют курсорной навигации
+          headers:
+            X-Request-Id:
+              description: "Уникальный идентификатор запроса для distributed tracing (Jaeger)"
+              schema:
+                type: "string"
+                format: "uuid"
+              example: "550e8400-e29b-41d4-a716-446655440000"
+            X-Cache:
+              description: "Статус кэширования ответа (HIT/MISS)"
+              schema:
+                type: "string"
+                enum: ["HIT", "MISS"]
+              example: "HIT"
+          content:
+            application/json:
+              schema:
+                type: "object"
+                required:
+                  - "data"
+                  - "pagination"
+                  - "meta"
+                properties:
+                  data:
+                    type: "array"
+                    description: "Список записей пациента"
+                    items:
+                      $ref: "#/components/schemas/Appointment"
+                  pagination:
+                    $ref: "#/components/schemas/Pagination"
+                  meta:
+                    $ref: "#/components/schemas/Meta"
+              example:
+                data:
+                  - id: "apt-001"
+                    patient_id: "pat-123"
+                    doctor:
+                      id: "doc-456"
+                      full_name: "Иванова Мария Сергеевна"
+                      speciality: "Терапевт"
+                      department: "Поликлиника №1"
+                    slot:
+                      id: "slot-789"
+                      datetime: "2025-05-15T14:00:00+03:00"
+                      duration_minutes: 30
+                    lab_booking:
+                      id: "lab-001"
+                      analysis_type: "Общий анализ крови"
+                      datetime: "2025-05-15T14:30:00+03:00"
+                      department: "Лаборатория №1"
+                    polis:
+                      type: "ДМС"
+                      number: "ДМС-456789"
+                      copay: 500.00
+                    payment:
+                      id: "pay-001"
+                      amount: 1500.00
+                      status: "paid"
+                      paid_at: "2025-05-10T10:30:00+03:00"
+                    status: "confirmed"
+                    created_at: "2025-05-10T10:30:00+03:00"
+                    updated_at: "2025-05-10T10:35:00+03:00"
+                  - id: "apt-002"
+                    patient_id: "pat-123"
+                    doctor:
+                      id: "doc-789"
+                      full_name: "Петров Алексей Иванович"
+                      speciality: "Кардиолог"
+                      department: "Поликлиника №2"
+                    slot:
+                      id: "slot-790"
+                      datetime: "2025-05-20T10:00:00+03:00"
+                      duration_minutes: 45
+                    lab_booking: null
+                    polis:
+                      type: "ОМС"
+                      number: "ОМС-123456"
+                      copay: 0.00
+                    payment:
+                      id: "pay-002"
+                      amount: 0.00
+                      status: "no_payment_required"
+                      paid_at: null
+                    status: "confirmed"
+                    created_at: "2025-05-08T09:00:00+03:00"
+                    updated_at: "2025-05-08T09:05:00+03:00"
+                pagination:
+                  total: 5
+                  limit: 10
+                  offset: 0
+                  next_offset: null
+                  previous_offset: null
+                meta:
+                  request_id: "550e8400-e29b-41d4-a716-446655440000"
+                  response_time_ms: 85
+                  cache: "HIT"
+                  timestamp: "2025-05-10T14:30:00+03:00"
+                  api_version: "v1"
+
+        '400':
+          description: |
+            Некорректный запрос. Один или несколько параметров не прошли валидацию.
+          headers:
+            X-Request-Id:
+              schema:
+                type: "string"
+                format: "uuid"
+              example: "660f9500-e29b-41d4-a716-446655440001"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error:
+                  code: "INVALID_PARAMETER"
+                  message: "Параметр 'limit' должен быть от 1 до 50"
+                  details:
+                    - field: "limit"
+                      value: 100
+                      constraint: "maximum: 50"
+                  request_id: "660f9500-e29b-41d4-a716-446655440001"
+                  timestamp: "2025-05-10T14:30:00+03:00"
+
+        '401':
+          description: |
+            Неавторизованный запрос. JWT токен отсутствует, истёк или невалиден.
+            
+            **Возможные причины:**
+            - Отсутствует заголовок Authorization
+            - Токен истёк (срок действия: 24 часа)
+            - Токен был отозван (смена пароля, блокировка аккаунта)
+            - Неверная подпись токена
+          headers:
+            X-Request-Id:
+              schema:
+                type: "string"
+                format: "uuid"
+              example: "770g0600-e29b-41d4-a716-446655440002"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error:
+                  code: "UNAUTHORIZED"
+                  message: "Недействительный или истёкший токен авторизации"
+                  details:
+                    - reason: "token_expired"
+                      expired_at: "2025-05-09T14:30:00+03:00"
+                  request_id: "770g0600-e29b-41d4-a716-446655440002"
+                  timestamp: "2025-05-10T14:30:00+03:00"
+
+        '500':
+          description: |
+            Внутренняя ошибка сервера. Запрос не может быть обработан из-за
+            сбоя в одном из компонентов системы.
+            
+            **Возможные причины (проблемы AS-IS):**
+            - Redis недоступен (cache miss → ошибка)
+            - 1С не отвечает (проверка полиса не удалась)
+            - CRM не отвечает (база данных заблокирована, INT-009)
+            - Kafka недоступна (невозможно получить актуальные данные)
+            
+            **Действия пациента:** Повторить запрос через несколько минут.
+            Если ошибка повторяется — обратиться в службу поддержки.
+          headers:
+            X-Request-Id:
+              schema:
+                type: "string"
+                format: "uuid"
+              example: "880h0700-e29b-41d4-a716-446655440003"
+            Retry-After:
+              description: "Рекомендуемое время ожидания перед повторным запросом (в секундах)"
+              schema:
+                type: "integer"
+                example: 30
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error:
+                  code: "INTERNAL_SERVER_ERROR"
+                  message: "Внутренняя ошибка сервера. Пожалуйста, повторите запрос позже."
+                  details:
+                    - component: "redis"
+                      status: "unavailable"
+                      suggestion: "Повторить запрос через 30 секунд"
+                    - incident_id: "INC-2025-05-10-001"
+                  request_id: "880h0700-e29b-41d4-a716-446655440003"
+                  timestamp: "2025-05-10T14:30:00+03:00"
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: "http"
+      scheme: "bearer"
+      bearerFormat: "JWT"
+      description: |
+        JWT токен, полученный при аутентификации через мобильное приложение.
+        
+        **Структура токена:**
+        - Header: { "alg": "RS256", "typ": "JWT" }
+        - Payload: { 
+            "sub": "patient_id",
+            "iat": "время выдачи",
+            "exp": "время истечения (24 часа)",
+            "roles": ["patient"]
+          }
+        - Signature: RS256 с использованием приватного ключа Auth Service
+        
+        **Инструкция:** Добавьте токен в заголовок Authorization:
+        `Authorization: Bearer <token>`
+
+  schemas:
+    Appointment:
+      type: "object"
+      description: "Запись к врачу"
+      required:
+        - "id"
+        - "patient_id"
+        - "doctor"
+        - "slot"
+        - "status"
+      properties:
+        id:
+          type: "string"
+          format: "uuid"
+          description: "Уникальный идентификатор записи"
+          example: "apt-001"
+        patient_id:
+          type: "string"
+          description: "Идентификатор пациента (из JWT токена)"
+          example: "pat-123"
+        doctor:
+          $ref: "#/components/schemas/Doctor"
+        slot:
+          $ref: "#/components/schemas/Slot"
+        lab_booking:
+          type: "object"
+          nullable: true
+          description: "Информация о лабораторном исследовании (если назначено)"
+          properties:
+            id:
+              type: "string"
+              example: "lab-001"
+            analysis_type:
+              type: "string"
+              description: "Тип анализа"
+              example: "Общий анализ крови"
+            datetime:
+              type: "string"
+              format: "date-time"
+              example: "2025-05-15T14:30:00+03:00"
+            department:
+              type: "string"
+              description: "Лаборатория"
+              example: "Лаборатория №1"
+        polis:
+          $ref: "#/components/schemas/PolisInfo"
+        payment:
+          $ref: "#/components/schemas/PaymentInfo"
+        status:
+          type: "string"
+          description: |
+            Статус записи:
+            - `pending` — ожидает подтверждения оплаты
+            - `confirmed` — подтверждена (оплачена)
+            - `cancelled` — отменена пациентом или врачом
+            - `completed` — приём состоялся
+          enum:
+            - "pending"
+            - "confirmed"
+            - "cancelled"
+            - "completed"
+          example: "confirmed"
+        created_at:
+          type: "string"
+          format: "date-time"
+          description: "Дата и время создания записи"
+          example: "2025-05-10T10:30:00+03:00"
+        updated_at:
+          type: "string"
+          format: "date-time"
+          description: "Дата и время последнего обновления записи"
+          example: "2025-05-10T10:35:00+03:00"
+
+    Doctor:
+      type: "object"
+      description: "Информация о враче"
+      required:
+        - "id"
+        - "full_name"
+        - "speciality"
+      properties:
+        id:
+          type: "string"
+          example: "doc-456"
+        full_name:
+          type: "string"
+          description: "Полное имя врача"
+          example: "Иванова Мария Сергеевна"
+        speciality:
+          type: "string"
+          description: "Специальность врача"
+          example: "Терапевт"
+        department:
+          type: "string"
+          description: "Отделение клиники"
+          example: "Поликлиника №1"
+        photo_url:
+          type: "string"
+          format: "uri"
+          description: "URL фотографии врача (если доступна)"
+          example: "https://cdn.zdorovieplus.ru/doctors/doc-456.jpg"
+
+    Slot:
+      type: "object"
+      description: "Информация о временном слоте приёма"
+      required:
+        - "id"
+        - "datetime"
+        - "duration_minutes"
+      properties:
+        id:
+          type: "string"
+          example: "slot-789"
+        datetime:
+          type: "string"
+          format: "date-time"
+          description: "Дата и время начала приёма"
+          example: "2025-05-15T14:00:00+03:00"
+        duration_minutes:
+          type: "integer"
+          description: "Длительность приёма в минутах"
+          example: 30
+
+    PolisInfo:
+      type: "object"
+      description: "Информация о полисе ДМС/ОМС"
+      properties:
+        type:
+          type: "string"
+          enum: ["ДМС", "ОМС"]
+          example: "ДМС"
+        number:
+          type: "string"
+          example: "ДМС-456789"
+        copay:
+          type: "number"
+          format: "double"
+          description: "Сумма доплаты (0 для ОМС)"
+          example: 500.00
+
+    PaymentInfo:
+      type: "object"
+      description: "Информация об оплате"
+      properties:
+        id:
+          type: "string"
+          example: "pay-001"
+        amount:
+          type: "number"
+          format: "double"
+          description: "Сумма оплаты"
+          example: 1500.00
+        status:
+          type: "string"
+          description: |
+            Статус оплаты:
+            - `pending` — ожидает оплаты
+            - `paid` — оплачено
+            - `refunded` — возвращено
+            - `no_payment_required` — оплата не требуется (ОМС)
+          enum:
+            - "pending"
+            - "paid"
+            - "refunded"
+            - "no_payment_required"
+          example: "paid"
+        paid_at:
+          type: "string"
+          format: "date-time"
+          nullable: true
+          description: "Дата и время оплаты (null для ОМС)"
+          example: "2025-05-10T10:30:00+03:00"
+
+    Pagination:
+      type: "object"
+      description: |
+        Метаданные пагинации на основе offset.
+        
+        **Почему offset-based, а не cursor-based:**
+        - Записи редко меняют порядок (дата приёма фиксирована)
+        - Проще реализовать на стороне клиента (пациенты
+          ожидают номера страниц, а не курсоры)
+        - Не требуется поддержка real-time синхронизации
+          для списка предстоящих записей
+        
+        **Расчёт страниц:**
+        - Всего записей: total
+        - Записей на странице: limit
+        - Текущая страница: offset / limit + 1
+        - Всего страниц: ceil(total / limit)
+      required:
+        - "total"
+        - "limit"
+        - "offset"
+      properties:
+        total:
+          type: "integer"
+          description: "Общее количество записей, соответствующих фильтру"
+          example: 42
+        limit:
+          type: "integer"
+          description: "Максимальное количество записей на странице"
+          example: 10
+        offset:
+          type: "integer"
+          description: "Текущее смещение"
+          example: 20
+        next_offset:
+          type: "integer"
+          nullable: true
+          description: "Смещение для следующей страницы (null, если страница последняя)"
+          example: 30
+        previous_offset:
+          type: "integer"
+          nullable: true
+          description: "Смещение для предыдущей страницы (null, если страница первая)"
+          example: 10
+
+    Meta:
+      type: "object"
+      description: "Метаданные запроса"
+      properties:
+        request_id:
+          type: "string"
+          format: "uuid"
+          description: "Уникальный идентификатор запроса (Jaeger trace ID)"
+          example: "550e8400-e29b-41d4-a716-446655440000"
+        response_time_ms:
+          type: "integer"
+          description: "Время обработки запроса в миллисекундах"
+          example: 85
+        cache:
+          type: "string"
+          enum: ["HIT", "MISS"]
+          description: "Статус кэширования ответа"
+          example: "HIT"
+        timestamp:
+          type: "string"
+          format: "date-time"
+          description: "Время формирования ответа сервером"
+          example: "2025-05-10T14:30:00+03:00"
+        api_version:
+          type: "string"
+          description: "Версия API"
+          example: "v1"
+
+    ErrorResponse:
+      type: "object"
+      description: "Стандартный формат ошибки API"
+      required:
+        - "error"
+      properties:
+        error:
+          type: "object"
+          required:
+            - "code"
+            - "message"
+          properties:
+            code:
+              type: "string"
+              description: "Код ошибки для программной обработки"
+              example: "INVALID_PARAMETER"
+            message:
+              type: "string"
+              description: "Человекочитаемое описание ошибки"
+              example: "Параметр 'limit' должен быть от 1 до 50"
+            details:
+              type: "array"
+              description: "Детали ошибки (для отладки)"
+              items:
+                type: "object"
+                properties:
+                  field:
+                    type: "string"
+                    example: "limit"
+                  value:
+                    type: "string"
+                    example: "100"
+                  constraint:
+                    type: "string"
+                    example: "maximum: 50"
+            request_id:
+              type: "string"
+              format: "uuid"
+              description: "Идентификатор запроса для поддержки"
+              example: "660f9500-e29b-41d4-a716-446655440001"
+            timestamp:
+              type: "string"
+              format: "date-time"
+              description: "Время возникновения ошибки"
+              example: "2025-05-10T14:30:00+03:00"
